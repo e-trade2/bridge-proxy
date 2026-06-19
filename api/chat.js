@@ -1,23 +1,16 @@
 // ══════════════════════════════════════════════════════
 //  api/chat.js  —  Vercel Serverless Proxy
-//  Keeps your Claude API key secret on the server
+//  Keeps your Gemini API key secret on the server
 //
-//  HOW TO DEPLOY (5 minutes):
-//  1. Create a free account at vercel.com
-//  2. Install Vercel CLI:  npm install -g vercel
-//  3. Create a new folder called "bridge-broker-proxy"
-//  4. Put this file inside it at: api/chat.js
-//  5. Also create package.json (see bottom of this file)
-//  6. Run: vercel deploy
-//  7. In Vercel dashboard → Settings → Environment Variables
-//     Add: ANTHROPIC_API_KEY = sk-ant-...your key...
-//  8. Copy your deployment URL and paste it into
-//     delala-ai.js as the PROXY_URL value
+//  HOW TO DEPLOY:
+//  1. In Vercel dashboard → Settings → Environment Variables
+//     Add: GEMINI_API_KEY = AQ.Ab8RN6...[your key]
+//  2. Deploy project
 // ══════════════════════════════════════════════════════
 
 export default async function handler(req, res) {
-  // Allow requests from your Bridge Broker domain
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Change to your domain in production
+  // Allow requests from your Bridge Broker local domain
+  res.setHeader('Access-Control-Allow-Origin', '*'); 
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -37,9 +30,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Convert Claude-style messages ({role, content}) to Gemini's format
+    // Convert generic messages ({role, content}) to Gemini's format
     const geminiContents = messages.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
+      role: m.role === 'user' ? 'user' : 'model',
       parts: [{ text: m.content }]
     }));
 
@@ -50,7 +43,8 @@ export default async function handler(req, res) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: geminiContents,
-          systemInstruction: { parts: [{ text: system || '' }] },
+          // FIXED: Must be snake_case for the REST endpoint to read your prompt
+          system_instruction: { parts: [{ text: system || '' }] },
           generationConfig: {
             temperature: 0.7,
             maxOutputTokens: 400
@@ -68,7 +62,7 @@ export default async function handler(req, res) {
 
     const aiText = data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't respond right now.";
 
-    // Return in the same shape delala-ai.js already expects: data.content[0].text
+    // Return in the exact shape your delala-ai.js frontend expects
     return res.status(200).json({
       content: [{ text: aiText }]
     });
@@ -78,12 +72,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
-
-// ── package.json for the proxy folder ────────────────
-// Create a file called package.json with this content:
-//
-// {
-//   "name": "bridge-broker-proxy",
-//   "version": "1.0.0",
-//   "private": true
-// }
