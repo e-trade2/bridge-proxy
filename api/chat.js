@@ -6,12 +6,16 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { system, messages } = req.body;
+  let body = req.body;
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch(e) {}
+  }
+
+  const { system, messages } = body || {};
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  // Convert messages to Gemini format
   const geminiMessages = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
@@ -33,20 +37,16 @@ export default async function handler(req, res) {
 
     if (!response.ok) {
       const err = await response.text();
-      console.error('Gemini API error:', err);
-      return res.status(502).json({ error: 'AI service unavailable' });
+      console.error('Gemini error:', err);
+      return res.status(502).json({ error: 'AI unavailable' });
     }
 
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't respond right now.";
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I could not respond right now.";
+    return res.status(200).json({ content: [{ type: 'text', text }] });
 
-    // Return in same format as Claude so delala-ai.js works unchanged
-    return res.status(200).json({
-      content: [{ type: 'text', text }]
-    });
-
-  } catch (error) {
-    console.error('Proxy error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    console.error('Proxy error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 }
