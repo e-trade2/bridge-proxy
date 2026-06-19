@@ -7,35 +7,43 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { system, messages } = req.body;
-
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
+  // Convert messages to Gemini format
+  const geminiMessages = messages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }));
+
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 400,
-        system: system || '',
-        messages: messages
-      })
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: system || '' }] },
+          contents: geminiMessages,
+          generationConfig: { maxOutputTokens: 400, temperature: 0.7 }
+        })
+      }
+    );
 
     if (!response.ok) {
       const err = await response.text();
-      console.error('Claude API error:', err);
+      console.error('Gemini API error:', err);
       return res.status(502).json({ error: 'AI service unavailable' });
     }
 
     const data = await response.json();
-    return res.status(200).json(data);
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't respond right now.";
+
+    // Return in same format as Claude so delala-ai.js works unchanged
+    return res.status(200).json({
+      content: [{ type: 'text', text }]
+    });
 
   } catch (error) {
     console.error('Proxy error:', error);
