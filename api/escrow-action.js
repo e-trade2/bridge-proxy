@@ -33,7 +33,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "null"; // fails closed — set ALLOWED_ORIGIN in Vercel to your real domain (e.g. https://www.bridge-broker.com)
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
@@ -101,84 +101,67 @@ export default async function handler(req, res) {
 
       const { error: updErr } = await supabaseAdmin
         .from("escrow_transactions")
-        .update({ status: "disputed", dispute_note: note })
+        .update({
+          status: "disputed",
+          dispute_note: note,
+          disputed_by: userData.user.id,
+          disputed_at: new Date().toISOString(),
+        })
         .eq("tx_ref", txRef);
       if (updErr) throw updErr;
 
       return res.status(200).json({ ok: true, status: "disputed" });
     }
 
-    const newStatus = action === "release" ? "released" : "refunded";
-
-    let payoutInfo = null;
-
     if (action === "release") {
-      // ── Look up the listing's commission rate (set by the admin
-      //    at approval time) and apply it to the escrow amount. ──
-      const { data: listing, error: listingErr } = await supabaseAdmin
-        .from("listings")
-        .select("id, commission_percent, status")
-        .eq("id", escrow.listing_id)
-        .single();
+      // ── Atomic release via DB function (prevents double-release race) ──
+      // release_escrow() uses SELECT … FOR UPDATE to lock the row, then
+      // checks the status again inside the transaction. If two admin
+      // sessions both call "release" simultaneously, one gets 'ok' and
+      // the other gets 'conflict' — the second call updates 0 rows and
+      // returns early instead of creating a second commission deduction
+      // or marking the listing sold a second time.
+      // See sql/setup_fixes.sql for the full function definition.
+      const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc(
+        "release_escrow",
+        {
+          p_tx_ref:          txRef,
+          p_resolved_by:     userData.user.id,
+          p_resolution_note: note || null,
+        }
+      );
+      if (rpcErr) throw rpcErr;
 
-      if (listingErr || !listing)
-        return res.status(404).json({ error: "Linked listing not found — cannot compute commission" });
+      if (rpcResult.result === "not_found")
+        return res.status(404).json({ error: "Escrow transaction not found" });
 
-      if (listing.commission_percent == null)
-        return res.status(400).json({
-          error: "This listing has no commission rate on record. Re-approve it in Pending Listings (or All Listings, once re-opened) to set one before releasing escrow.",
+      if (rpcResult.result === "conflict")
+        return res.status(409).json({
+          error: "This escrow was already released by another session. Refresh and try again.",
         });
 
-      const commissionPct = Number(listing.commission_percent);
-      const commissionDeducted = Math.round((escrow.amount * commissionPct / 100) * 100) / 100;
-      const sellerPayout = Math.round((escrow.amount - commissionDeducted) * 100) / 100;
+      if (rpcResult.result === "wrong_status")
+        return res.status(400).json({
+          error: `Cannot release a transaction in status '${rpcResult.status}'`,
+        });
 
-      const { error: escrowUpdErr } = await supabaseAdmin
-        .from("escrow_transactions")
-        .update({
-          status: newStatus,
-          resolution_note: note || null,
-          resolved_by: userData.user.id,
-          resolved_at: new Date().toISOString(),
-          commission_deducted: commissionDeducted,
-        })
-        .eq("tx_ref", txRef);
-      if (escrowUpdErr) throw escrowUpdErr;
-
-      // Only mark the listing sold/commission-collected if it isn't
-      // already (e.g. admin somehow released the same escrow twice —
-      // state machine guard above already prevents that, but this
-      // keeps a re-released disputed transaction from double-marking).
-      if (listing.status !== "sold") {
-        const { error: listingUpdErr } = await supabaseAdmin
-          .from("listings")
-          .update({
-            status: "sold",
-            sold_at: new Date().toISOString(),
-            sold_by: userData.user.id,
-            sale_price: escrow.amount,
-            commission_owed: commissionDeducted,
-            commission_status: "collected",
-            commission_note: `Deducted from escrow payout (tx_ref ${txRef})`,
-          })
-          .eq("id", listing.id);
-        if (listingUpdErr) throw listingUpdErr;
-      }
-
-      payoutInfo = {
-        escrowAmount: escrow.amount,
-        commissionPercent: commissionPct,
-        commissionDeducted,
-        sellerPayout,
-      };
-
-      return res.status(200).json({ ok: true, status: newStatus, payout: payoutInfo });
+      return res.status(200).json({
+        ok: true,
+        status: "released",
+        payout: {
+          escrowAmount:       rpcResult.escrow_amount,
+          commissionPercent:  rpcResult.commission_percent,
+          commissionDeducted: rpcResult.commission_deducted,
+          sellerPayout:       rpcResult.seller_payout,
+        },
+      });
     }
 
+    // action === "refund"
     const { error: updErr } = await supabaseAdmin
       .from("escrow_transactions")
       .update({
-        status: newStatus,
+        status: "refunded",
         resolution_note: note || null,
         resolved_by: userData.user.id,
         resolved_at: new Date().toISOString(),
@@ -186,7 +169,7 @@ export default async function handler(req, res) {
       .eq("tx_ref", txRef);
     if (updErr) throw updErr;
 
-    return res.status(200).json({ ok: true, status: newStatus });
+    return res.status(200).json({ ok: true, status: "refunded" });
   } catch (error) {
     console.error("escrow-action error:", error);
     return res.status(500).json({ error: "Internal server error" });
