@@ -17,6 +17,8 @@
 //     Add: SUPABASE_SERVICE_ROLE_KEY = your Supabase service role key
 //          (Settings → API in Supabase — NOT the publishable key,
 //          this one must stay server-side only)
+//     Add: SITE_URL              = https://www.bridge-broker.com
+//          (used as the base for Chapa callback_url and return_url)
 //  2. Deploy
 //
 //  Sign up for a Chapa merchant account: https://dashboard.chapa.co
@@ -24,19 +26,38 @@
 
 import { createClient } from "@supabase/supabase-js";
 
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "null"; // fails closed — set ALLOWED_ORIGIN in Vercel to your real domain (e.g. https://www.bridge-broker.com)
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Pricing — keep in sync with what's shown in seller-dashboard.html
-const PRICING = {
-  featured_1week:  { amount: 200,  weeks: 1, label: "Featured Listing — 1 week"  },
-  featured_4weeks: { amount: 700,  weeks: 4, label: "Featured Listing — 4 weeks" },
-  verified_badge:  { amount: 0,    weeks: 0, label: "Verified Seller Badge"      }, // free, kept for clarity — verification itself is admin-reviewed, not paid
+// Pricing — loaded from Supabase admin_settings at request time so the
+// admin can change prices from admin.html without touching code.
+// Falls back to hardcoded defaults if the DB rows don't exist yet.
+const PRICING_DEFAULTS = {
+  featured_1week:  { amount: 200, weeks: 1, label: "Featured Listing — 1 week"  },
+  featured_4weeks: { amount: 700, weeks: 4, label: "Featured Listing — 4 weeks" },
+  verified_badge:  { amount: 0,   weeks: 0, label: "Verified Seller Badge"      },
 };
+
+async function getPricing(supabaseAdmin) {
+  const pricing = JSON.parse(JSON.stringify(PRICING_DEFAULTS)); // deep copy
+  try {
+    const { data } = await supabaseAdmin
+      .from("admin_settings")
+      .select("key, value")
+      .in("key", ["bb_price_featured_1week", "bb_price_featured_4weeks"]);
+    (data || []).forEach(row => {
+      if (row.key === "bb_price_featured_1week"  && row.value) pricing.featured_1week.amount  = Number(row.value);
+      if (row.key === "bb_price_featured_4weeks" && row.value) pricing.featured_4weeks.amount = Number(row.value);
+    });
+  } catch (e) {
+    console.warn("payment-init: could not load pricing from DB, using defaults:", e.message);
+  }
+  return pricing;
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
@@ -54,9 +75,14 @@ export default async function handler(req, res) {
     if (!listingId || !plan || !email || !accessToken)
       return res.status(400).json({ error: "listingId, plan, email and accessToken are required" });
 
-    const pricing = PRICING[plan];
-    if (!pricing || pricing.amount <= 0)
+    const pricing = (await getPricing(supabaseAdmin))[plan];
+    if (!pricing)
       return res.status(400).json({ error: "Invalid plan" });
+
+    // verified_badge is free and admin-reviewed — it never goes through
+    // a payment checkout, so this endpoint has nothing to do for it.
+    if (pricing.amount <= 0)
+      return res.status(400).json({ error: "The verified_badge plan has no payment — badge requests are handled by the admin directly." });
 
     // ── Verify the caller is actually logged in and owns this listing ──
     const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(accessToken);
@@ -89,6 +115,25 @@ export default async function handler(req, res) {
     }]);
     if (payErr) throw payErr;
 
+    // ── Normalize phone for Chapa, if we have one ──
+    // user.phone (Supabase Auth) is usually empty here since this app
+    // only does email/password signup — phone auth needs a paid Supabase
+    // plan (see README). When it IS present, Chapa's API wants LOCAL
+    // 10-digit format — 09xxxxxxxx or 07xxxxxxxx — not +251xxxxxxxxx or
+    // any other raw format auth.users.phone might happen to hold.
+    // (Confirmed against Chapa's own docs/example payload at
+    // developer.chapa.co/integrations/accept-payments, which uses
+    // "phone_number": "0912345678".)
+    const toChapaPhone = (raw) => {
+      if (!raw) return undefined;
+      let d = String(raw).replace(/[\s\-().]/g, '');
+      if (d.startsWith('+251')) d = d.slice(4);
+      else if (d.startsWith('251')) d = d.slice(3);
+      if (d.length === 9 && /^[79]\d{8}$/.test(d)) d = '0' + d;
+      return /^0[79]\d{8}$/.test(d) ? d : undefined; // not a recognisable ET mobile number — omit rather than send something Chapa will choke on
+    };
+    const chapaPhoneNumber = toChapaPhone(phone);
+
     // ── Ask Chapa to start the checkout session ──
     const chapaRes = await fetch("https://api.chapa.co/v1/transaction/initialize", {
       method: "POST",
@@ -102,7 +147,7 @@ export default async function handler(req, res) {
         email,
         first_name: firstName || "Bridge",
         last_name: lastName || "Broker",
-        phone_number: phone || undefined,
+        phone_number: chapaPhoneNumber,
         tx_ref,
         callback_url: `${process.env.SITE_URL || ""}/api/payment-webhook`,
         return_url: returnUrl || `${process.env.SITE_URL || ""}/seller-dashboard.html?payment=processing`,
